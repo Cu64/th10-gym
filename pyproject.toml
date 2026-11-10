@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "th10-gym"
+version = "0.4.0"
+description = "A Gymnasium interface and read-only memory tools for Touhou 10"
+requires-python = ">=3.11"
+dependencies = ["gymnasium>=1.0,<2", "numpy>=1.24"]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+include = ["th10_gym*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

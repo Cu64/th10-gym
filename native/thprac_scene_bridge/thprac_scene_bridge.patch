@@ -1,0 +1,1019 @@
+diff --git a/thprac/loc_json_build_msvc.bat b/thprac/loc_json_build_msvc.bat
+index 3023d65..db707ed 100644
+--- a/thprac/loc_json_build_msvc.bat
++++ b/thprac/loc_json_build_msvc.bat
+@@ -1,2 +1,2 @@
+ @echo off
+-cl /Ilib\yyjson /nologo /EHsc /Zi /Gy /O2 /std:c++20 loc_json.cpp /Fe:loc_json.exe /link /INCREMENTAL:NO /OPT:REF
++cl /Ilib\yyjson /nologo /EHsc /Zi /Gy /O2 /std:c++20 loc_json.cpp /Fe:loc_json.exe /link /INCREMENTAL:NO /OPT:REF /MANIFEST:EMBED /MANIFESTUAC:"level='asInvoker' uiAccess='false'"
+diff --git a/thprac/src/thprac_games.h b/thprac/src/thprac_games.h
+index 461cd3b..32a7d83 100644
+--- a/thprac/src/thprac_games.h
++++ b/thprac/src/thprac_games.h
+@@ -144,6 +144,14 @@ public:
+     {
+         return mStatus;
+     }
++    inline bool HooksMatch(bool status) const
++    {
++        if (mStatus != status) return false;
++        for (size_t i = 0; i < mHooks.len; ++i) {
++            if (mHooks.ptr[i].enabled != status) return false;
++        }
++        return true;
++    }
+     bool operator()(bool use_widget = true);
+ };
+ 
+diff --git a/thprac/src/thprac_th10.cpp b/thprac/src/thprac_th10.cpp
+index 310f65b..30ee317 100644
+--- a/thprac/src/thprac_th10.cpp
++++ b/thprac/src/thprac_th10.cpp
+@@ -1,8 +1,559 @@
+ #include "thprac_games.h"
+ #include "thprac_utils.h"
++#include "thprac_scene_bridge_protocol.h"
++#include "thprac_scene_bridge_dialogue_harness.h"
+ 
+ 
+ namespace TH10 {
++    using thprac_scene_bridge::Mapping;
++    using thprac_scene_bridge::Status;
++    using thprac_scene_bridge::Error;
++    using thprac_scene_bridge::SectionPatchVerification;
++    using thprac_scene_bridge::SectionDialoguePolicy;
++    static HANDLE sceneBridgeMappingHandle = nullptr;
++    static Mapping* sceneBridge = nullptr;
++    static Mapping sceneRequest {};
++    static LONG sceneRequestSequence = 0;
++    static bool sceneFrontendActive = false;
++    static bool sceneNormalRunActive = false;
++    static thprac_scene_bridge::DialogueHarness sceneDialogueHarness;
++    static bool sceneDialogueHooksReady = false;
++    static LONG sceneDialogueAdvanceOverrides = 0;
++    static LONG sceneDialogueBranchVisits = 0;
++    static LONG sceneDialogueLeaseGeneration = 0;
++    static LONG sceneDialogueLeaseDurationMs = 0;
++    static LONG sceneDialogueLeaseRequestSequence = 0;
++    static uint64_t sceneDialogueLeaseDeadlineMs = 0;
++    static uint8_t sceneDialogueLeaseRequestId[16] = {};
++    static LONG sceneRestartSequence = 0;
++    static LONG sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::None;
++    static LONG sceneRestartInputPolls = 0;
++    static LONG sceneRestartLastInputActive = 0;
++    static LONG sceneRestartInputHookEntries = 0;
++    static LONG sceneRestartInactiveInputPolls = 0;
++    static LONG sceneRestartRoute = 0;
++    static bool sceneRestartAwaitingTitle = false;
++    static bool sceneRetryPending = false;
++    static LONG sceneRetrySequence = 0;
++    static uint8_t sceneRetryRequestId[16] = {};
++    static uint64_t sceneRetryDeadlineMs = 0;
++    using thprac_scene_bridge::SceneRestartGuard;
++    static SceneRestartGuard sceneRestartGuard;
++    static void SceneStartFromTitle(uint8_t* frontend);
++    static void SceneVerifyStarted();
++    static void SceneBeginResponseWrite();
++    static void SceneEndResponseWrite();
++    static int CalcSceneSection(const Mapping& req);
++    static void SceneDialogueLeaseTick();
++    static bool SceneRestartStartupShouldVerify();
++    static bool SceneBytesMatch(uintptr_t address, const uint8_t* expected, size_t length)
++    {
++        return memcmp((const void*)address, expected, length) == 0;
++    }
++
++    static void SceneDialogueBranch(PCONTEXT ctx, std::int32_t messageCase)
++    {
++        SceneDialogueLeaseTick();
++        ++sceneDialogueBranchVisits;
++        const bool zeroFlag = (ctx->EFlags & 0x40) != 0;
++        const bool forceAdvance = sceneDialogueHarness.ShouldAdvance(GetTickCount64(), messageCase, zeroFlag);
++        ctx->Eip = (DWORD)thprac_scene_bridge::Th10DialogueNextIp(messageCase, zeroFlag, forceAdvance);
++        if (forceAdvance && zeroFlag)
++            ++sceneDialogueAdvanceOverrides;
++        if (sceneBridge) {
++            SceneBeginResponseWrite();
++            sceneBridge->dialogue_advance_forced = sceneDialogueAdvanceOverrides;
++            sceneBridge->dialogue_branch_visits = sceneDialogueBranchVisits;
++            SceneEndResponseWrite();
++        }
++    }
++
++    static void SceneDialogueLeaseTick()
++    {
++        if (!sceneBridge || !sceneDialogueHooksReady) return;
++        const uint64_t now = GetTickCount64();
++        if (sceneDialogueHarness.active()
++            && (sceneDialogueLeaseRequestSequence != sceneRequestSequence
++                || memcmp(sceneDialogueLeaseRequestId, sceneRequest.request_id, sizeof(sceneDialogueLeaseRequestId)) != 0)) {
++            sceneDialogueHarness.Disable();
++            sceneDialogueLeaseDurationMs = 0;
++            sceneDialogueLeaseDeadlineMs = 0;
++        }
++        const LONG firstGeneration = InterlockedCompareExchange(&sceneBridge->dialogue_lease_generation, 0, 0);
++        if (!(firstGeneration & 1) && firstGeneration != sceneDialogueLeaseGeneration) {
++            const LONG duration = sceneBridge->dialogue_lease_ms;
++            const uint64_t deadline = sceneBridge->dialogue_lease_deadline_tick_ms;
++            const LONG requestSequence = sceneBridge->dialogue_lease_request_sequence;
++            uint8_t requestId[16] = {};
++            memcpy(requestId, sceneBridge->dialogue_lease_request_id, sizeof(requestId));
++            const LONG secondGeneration = InterlockedCompareExchange(&sceneBridge->dialogue_lease_generation, 0, 0);
++            if (firstGeneration == secondGeneration && !(secondGeneration & 1)) {
++                sceneDialogueLeaseGeneration = secondGeneration;
++                const bool sameSession = requestSequence == sceneRequestSequence
++                    && sceneBridge->request_sequence == sceneRequestSequence
++                    && memcmp(requestId, sceneRequest.request_id, sizeof(requestId)) == 0;
++                if (sameSession && duration == 0) {
++                    sceneDialogueHarness.Disable();
++                    sceneDialogueLeaseDurationMs = 0;
++                    sceneDialogueLeaseDeadlineMs = 0;
++                    sceneDialogueLeaseRequestSequence = requestSequence;
++                    memcpy(sceneDialogueLeaseRequestId, requestId, sizeof(requestId));
++                } else if (sameSession && duration > 0
++                    && duration <= (LONG)thprac_scene_bridge::DialogueHarness::kMaxDurationMs
++                    && deadline > now && deadline - now <= (uint64_t)duration
++                    && sceneDialogueHarness.RenewUntil(now, deadline)) {
++                    sceneDialogueLeaseDurationMs = duration;
++                    sceneDialogueLeaseDeadlineMs = deadline;
++                    sceneDialogueLeaseRequestSequence = requestSequence;
++                    memcpy(sceneDialogueLeaseRequestId, requestId, sizeof(requestId));
++                } else {
++                    sceneDialogueHarness.Disable();
++                    sceneDialogueLeaseDurationMs = 0;
++                    sceneDialogueLeaseDeadlineMs = 0;
++                }
++            }
++        }
++        sceneDialogueHarness.Poll(now);
++        SceneBeginResponseWrite();
++        sceneBridge->dialogue_advance_ms = sceneDialogueLeaseDurationMs;
++        sceneBridge->dialogue_advance_deadline_tick_ms = sceneDialogueLeaseDeadlineMs;
++        SceneEndResponseWrite();
++    }
++
++    static bool SceneKnownStage3Boss1SignatureMatches()
++    {
++        __try {
++            const uintptr_t eclBaseSlot = GetMemAddr(0x477704, 0x54, 0x0c);
++            if (!eclBaseSlot) return false;
++            const uintptr_t eclData = *(uintptr_t*)eclBaseSlot;
++            if (!eclData) return false;
++            static const uint32_t jumpAtCa48[6] = { 0, 0x0018000c, 0x02ff0000, 0, 0x190c, 5885 };
++            static const uint32_t jumpAtE384[6] = { 0, 0x0018000c, 0x02ff0000, 0, 0x24, 5885 };
++            return SceneBytesMatch(eclData + 0xca48, (const uint8_t*)jumpAtCa48, sizeof(jumpAtCa48))
++                && SceneBytesMatch(eclData + 0xe384, (const uint8_t*)jumpAtE384, sizeof(jumpAtE384));
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            return false;
++        }
++    }
++
++    static SectionPatchVerification SceneVerifyKnownSectionPatch()
++    {
++        if (sceneRequest.stage != 3 || sceneRequest.section_kind != (int)thprac_scene_bridge::SectionKind::Boss
++            || sceneRequest.section_index != 0
++            || sceneRequest.section_dialogue_policy != (int)SectionDialoguePolicy::SkipSectionDialogue)
++            return SectionPatchVerification::Unverified;
++
++        return SceneKnownStage3Boss1SignatureMatches()
++            ? SectionPatchVerification::Matched
++            : SectionPatchVerification::Mismatch;
++    }
++
++    static void ScenePublish(Status status, Error error = Error::None)
++    {
++        if (!sceneBridge) return;
++        InterlockedIncrement(&sceneBridge->response_lock);
++        sceneBridge->status = (LONG)status;
++        sceneBridge->error = (LONG)error;
++        sceneBridge->response_sequence = sceneRequestSequence;
++        sceneBridge->last_update_tick_ms = GetTickCount64();
++        InterlockedIncrement(&sceneBridge->response_lock);
++    }
++
++    static void SceneBeginResponseWrite() { if (sceneBridge) InterlockedIncrement(&sceneBridge->response_lock); }
++    static void SceneEndResponseWrite() { if (sceneBridge) InterlockedIncrement(&sceneBridge->response_lock); }
++
++    static bool SceneReadGameOverRestartGuard(SceneRestartGuard& guard)
++    {
++        __try {
++            const uintptr_t owner = *(volatile uintptr_t*)0x477830;
++            if (!owner || owner < 0x400000 || owner > 0x7ffe0000) return false;
++            guard.ownerState = *(volatile LONG*)(owner + 0x04);
++            guard.ownerPathMarker = *(volatile LONG*)(owner + 0x1e4);
++            guard.lives = *(volatile LONG*)0x474c70;
++            guard.stage = *(volatile LONG*)0x474c7c;
++            guard.modeFlags = *(volatile LONG*)0x474ca0;
++            guard.managerFlags = *(volatile LONG*)(0x491c28 + 0x3cc);
++            guard.input = *(volatile uint16_t*)0x474e5c;
++            guard.frontendInput = *(volatile uint32_t*)0x474e30;
++            return true;
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            return false;
++        }
++    }
++
++    static bool SceneQueueRetailReturnToTitle()
++    {
++        static const uint8_t preimage[16] = {
++            0x8b, 0x88, 0xcc, 0x03, 0x00, 0x00, 0xf6, 0xc5,
++            0x10, 0x75, 0x0d, 0x8b, 0x4c, 0x24, 0x04, 0x89
++        };
++        if (!SceneBytesMatch(0x40ac90, preimage, sizeof(preimage))) return false;
++        __try {
++            // Exact retail call shape: PUSH 4; MOV EAX,491C28; CALL 40AC90.
++            __asm {
++                push 4
++                mov eax, 0491c28h
++                mov ecx, 040ac90h
++                call ecx
++            }
++            return true;
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            return false;
++        }
++    }
++
++    static bool SceneQueueGameplayRestart(thprac_scene_bridge::RestartRoute route)
++    {
++        using thprac_scene_bridge::RestartRoute;
++        const auto manager = GetMemContent(0x477810);
++        const auto replay = GetMemContent(0x477838);
++        if (!manager || !replay) return false;
++        const auto managerFlags = GetMemContent(manager + 0x58);
++        const bool changingProfile = route == RestartRoute::ProfileChange;
++        auto boundary = route;
++        if (changingProfile) {
++            boundary = RestartRoute::RetailRetry;
++            if (managerFlags & 0x10)
++                boundary = (int32_t)GetMemContent(0x474c70) == -1
++                    ? RestartRoute::GameOverRetry : RestartRoute::PracticeCompleteRetry;
++        }
++        const thprac_scene_bridge::RetailRetryState observed{
++            .stage = (int32_t)GetMemContent(0x474c7c),
++            .startStage = (int32_t)GetMemContent(0x474c80),
++            .modeFlags = GetMemContent(0x474ca0),
++            .currentState = (int32_t)GetMemContent(0x491fb8),
++            .previousState = (int32_t)GetMemContent(0x491fb4),
++            .managerFlags = managerFlags,
++            .replayMode = (int32_t)GetMemContent(replay + 0x10),
++            .input = *(volatile uint16_t*)0x474e5c,
++            .frontendInput = *(volatile uint32_t*)0x474e30,
++        };
++        if (!thprac_scene_bridge::Th10RetailRetryAllowed(
++                observed, sceneRequest.stage, sceneNormalRunActive, boundary, changingProfile))
++            return false;
++        if (boundary != RestartRoute::RetailRetry &&
++            (!SceneReadGameOverRestartGuard(sceneRestartGuard) ||
++             !thprac_scene_bridge::Th10RetailRetryTerminalMatches(
++                 boundary, sceneNormalRunActive, sceneRestartGuard.ownerState,
++                sceneRestartGuard.ownerPathMarker, sceneRestartGuard.lives)))
++            return false;
++        if (changingProfile) return SceneQueueRetailReturnToTitle();
++
++        static const uint8_t retryStore[] = {
++            0xc7, 0x05, 0xb8, 0x1f, 0x49, 0x00, 0x0a, 0x00, 0x00, 0x00,
++        };
++        if (!SceneBytesMatch(0x42316c, retryStore, sizeof(retryStore))) return false;
++        // Request a fresh start even at Game Over, where the menu can keep
++        // the current stage. The supervisor owns teardown and initialization.
++        *(volatile LONG*)0x491fb8 = 10;
++        return true;
++    }
++
++    static void SceneRestartPublish(LONG sequence, thprac_scene_bridge::RestartStatus status,
++        thprac_scene_bridge::RestartPhase phase, LONG error = 0)
++    {
++        if (!sceneBridge) return;
++        SceneBeginResponseWrite();
++        sceneBridge->restart_status = (LONG)status;
++        sceneBridge->restart_error = error;
++        sceneBridge->restart_phase = (LONG)phase;
++        sceneBridge->restart_input_polls = sceneRestartInputPolls;
++        sceneBridge->restart_last_input_active = sceneRestartLastInputActive;
++        sceneBridge->restart_input_hook_entries = sceneRestartInputHookEntries;
++        sceneBridge->restart_inactive_input_polls = sceneRestartInactiveInputPolls;
++        sceneBridge->restart_synthetic_input_polls = 0;
++        sceneBridge->restart_guard_owner_state = sceneRestartGuard.ownerState;
++        sceneBridge->restart_guard_owner_path_marker = sceneRestartGuard.ownerPathMarker;
++        sceneBridge->restart_guard_lives = sceneRestartGuard.lives;
++        sceneBridge->restart_guard_stage = sceneRestartGuard.stage;
++        sceneBridge->restart_guard_mode_flags = sceneRestartGuard.modeFlags;
++        sceneBridge->restart_guard_manager_flags = sceneRestartGuard.managerFlags;
++        sceneBridge->restart_guard_input = sceneRestartGuard.input;
++        sceneBridge->restart_guard_frontend_input = sceneRestartGuard.frontendInput;
++        sceneBridge->restart_response_sequence = sequence;
++        SceneEndResponseWrite();
++    }
++
++    // Poll on the game thread after input merging and before the supervisor update.
++    static void ScenePollRestart(bool inputActive)
++    {
++        if (!sceneBridge) return;
++        const LONG requestSequence = InterlockedCompareExchange(
++            &sceneBridge->restart_request_sequence, 0, 0);
++        if (requestSequence <= 0) return;
++        const auto recordInputState = [&]() {
++            sceneRestartLastInputActive = inputActive ? 1 : 0;
++            if (sceneRestartInputHookEntries < 0x7fffffffL)
++                ++sceneRestartInputHookEntries;
++            if (!inputActive && sceneRestartInactiveInputPolls < 0x7fffffffL)
++                ++sceneRestartInactiveInputPolls;
++        };
++        if (requestSequence != sceneRestartSequence) {
++            sceneRetryPending = false;
++            sceneRetrySequence = 0;
++            memset(sceneRetryRequestId, 0, sizeof(sceneRetryRequestId));
++            sceneRetryDeadlineMs = 0;
++            LONG status = InterlockedCompareExchange(&sceneBridge->restart_status, 0, 0);
++            LONG route = InterlockedCompareExchange(&sceneBridge->restart_route, 0, 0);
++            uint8_t sceneId[16] = {};
++            memcpy(sceneId, sceneBridge->restart_scene_request_id, sizeof(sceneId));
++            MemoryBarrier();
++            const LONG sequenceAfter = InterlockedCompareExchange(
++                &sceneBridge->restart_request_sequence, 0, 0);
++            const LONG routeAfter = InterlockedCompareExchange(&sceneBridge->restart_route, 0, 0);
++            const bool requestStable = requestSequence == sequenceAfter && route == routeAfter;
++            const bool cheatsDisabled = sceneRequest.invincible == 0
++                && sceneRequest.infinite_lives == 0 && sceneRequest.infinite_power == 0
++                && sceneRequest.time_lock == 0 && sceneRequest.auto_bomb == 0
++                && sceneRequest.no_faith_loss == 0;
++            const bool requestIdMatches = memcmp(
++                sceneId, sceneRequest.request_id, sizeof(sceneId)) == 0;
++            const bool valid = requestStable
++                && status == (LONG)thprac_scene_bridge::RestartStatus::Queued
++                && sceneRequestSequence > 0
++                && sceneBridge->applied_section_kind == sceneRequest.section_kind
++                && sceneBridge->applied_stage == sceneRequest.stage
++                && thprac_scene_bridge::Th10RestartSessionAllowed(
++                    (thprac_scene_bridge::RestartRoute)route, {
++                        .startedConfigured = sceneBridge->status == (LONG)Status::StartedConfigured,
++                        .sectionKind = sceneRequest.section_kind,
++                        .stage = sceneRequest.stage,
++                        .normalRunActive = sceneNormalRunActive,
++                        .practiceMode = (GetMemContent(0x474ca0)
++                            & thprac_scene_bridge::kTh10PracticeModeFlag) != 0,
++                        .cheatsDisabled = cheatsDisabled,
++                        .requestIdMatches = requestIdMatches,
++                    });
++            sceneRestartSequence = requestSequence;
++            sceneRestartInputPolls = 0;
++            sceneRestartLastInputActive = 0;
++            sceneRestartInputHookEntries = 0;
++            sceneRestartInactiveInputPolls = 0;
++            recordInputState();
++            sceneRestartRoute = route;
++            sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::None;
++            sceneRestartAwaitingTitle = false;
++            sceneRestartGuard = SceneRestartGuard{};
++            if (!valid) {
++                SceneRestartPublish(requestSequence,
++                    thprac_scene_bridge::RestartStatus::Rejected,
++                    thprac_scene_bridge::RestartPhase::None, 1);
++                return;
++            }
++            const auto restartRoute = (thprac_scene_bridge::RestartRoute)sceneRestartRoute;
++            const bool retailRetry = thprac_scene_bridge::Th10IsRetailRetry(restartRoute);
++            const bool changingProfile = restartRoute == thprac_scene_bridge::RestartRoute::ProfileChange;
++            if ((retailRetry || changingProfile) && (GetTickCount64() >= sceneBridge->restart_deadline_tick_ms
++                    || !SceneQueueGameplayRestart(restartRoute))) {
++                SceneRestartPublish(requestSequence,
++                    thprac_scene_bridge::RestartStatus::Rejected,
++                    thprac_scene_bridge::RestartPhase::None, 5);
++                return;
++            }
++            if (retailRetry) {
++                sceneRetryPending = true;
++                sceneRetrySequence = requestSequence;
++                memcpy(sceneRetryRequestId, sceneRequest.request_id,
++                    sizeof(sceneRetryRequestId));
++                sceneRetryDeadlineMs = sceneBridge->restart_deadline_tick_ms;
++                sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::AwaitStartup;
++                SceneRestartPublish(requestSequence,
++                    thprac_scene_bridge::RestartStatus::ActionQueued,
++                    thprac_scene_bridge::RestartPhase::AwaitStartup);
++                return;
++            }
++            if (changingProfile) {
++                sceneRestartAwaitingTitle = true;
++                sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::AwaitTitle;
++                SceneRestartPublish(requestSequence,
++                    thprac_scene_bridge::RestartStatus::ActionQueued,
++                    thprac_scene_bridge::RestartPhase::AwaitTitle);
++                return;
++            }
++            if (thprac_scene_bridge::Th10ReturnsToTitle(restartRoute)) {
++                SceneRestartGuard guard;
++                const bool readable = SceneReadGameOverRestartGuard(guard);
++                sceneRestartGuard = guard;
++                const bool normalRoute = sceneRestartRoute ==
++                    (LONG)thprac_scene_bridge::RestartRoute::GameOverReturnTitle;
++                const bool practiceFailureRoute = sceneRestartRoute ==
++                    (LONG)thprac_scene_bridge::RestartRoute::PracticeGameOverReturnTitle;
++                const bool terminal = normalRoute
++                    ? thprac_scene_bridge::Th10GameOverReturnTitleGuard(readable, guard)
++                    : practiceFailureRoute
++                    ? thprac_scene_bridge::Th10PracticeGameOverReturnTitleGuard(readable, guard)
++                    : thprac_scene_bridge::Th10PracticeStageCompleteReturnTitleGuard(readable, guard);
++                if (!terminal) {
++                    SceneRestartPublish(requestSequence,
++                        thprac_scene_bridge::RestartStatus::Rejected,
++                        thprac_scene_bridge::RestartPhase::None, 5);
++                    return;
++                }
++                sceneRestartAwaitingTitle = true;
++                sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::AwaitTitle;
++                if (!SceneQueueRetailReturnToTitle()) {
++                    sceneRestartAwaitingTitle = false;
++                    sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::None;
++                    SceneRestartPublish(requestSequence,
++                        thprac_scene_bridge::RestartStatus::Failed,
++                        thprac_scene_bridge::RestartPhase::None, 6);
++                    return;
++                }
++                ++sceneRestartInputPolls;
++                SceneRestartPublish(requestSequence,
++                    thprac_scene_bridge::RestartStatus::ActionQueued,
++                    thprac_scene_bridge::RestartPhase::AwaitTitle);
++                return;
++            }
++        } else {
++            const LONG currentStatus = InterlockedCompareExchange(
++                &sceneBridge->restart_status, 0, 0);
++            if (sceneBridge->restart_response_sequence == requestSequence &&
++                (currentStatus == (LONG)thprac_scene_bridge::RestartStatus::Queued ||
++                 currentStatus == (LONG)thprac_scene_bridge::RestartStatus::ActionQueued))
++                recordInputState();
++        }
++
++        const auto phase = (thprac_scene_bridge::RestartPhase)sceneRestartPhase;
++        if (phase == thprac_scene_bridge::RestartPhase::None ||
++            phase == thprac_scene_bridge::RestartPhase::Complete ||
++            phase == thprac_scene_bridge::RestartPhase::TitleReady ||
++            sceneBridge->restart_response_sequence != requestSequence)
++            return;
++        if (GetTickCount64() >= sceneBridge->restart_deadline_tick_ms) {
++            sceneRestartAwaitingTitle = false;
++            sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::None;
++            sceneRetryPending = false;
++            SceneRestartPublish(requestSequence,
++                thprac_scene_bridge::RestartStatus::Failed,
++                thprac_scene_bridge::RestartPhase::None, 2);
++            return;
++        }
++        if (phase == thprac_scene_bridge::RestartPhase::AwaitTitle) {
++            SceneRestartPublish(requestSequence,
++                thprac_scene_bridge::RestartStatus::ActionQueued,
++                thprac_scene_bridge::RestartPhase::AwaitTitle);
++            return;
++        }
++    }
++
++    static bool SceneOpenMapping()
++    {
++        wchar_t name[96] {};
++        swprintf_s(name, L"Local\\THPracSceneBridge_TH10_%lu", GetCurrentProcessId());
++        sceneBridgeMappingHandle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Mapping), name);
++        if (!sceneBridgeMappingHandle) return false;
++        sceneBridge = (Mapping*)MapViewOfFile(sceneBridgeMappingHandle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Mapping));
++        if (!sceneBridge) { CloseHandle(sceneBridgeMappingHandle); sceneBridgeMappingHandle = nullptr; return false; }
++        if (sceneBridge->magic != thprac_scene_bridge::kMagic || sceneBridge->version != thprac_scene_bridge::kVersion || sceneBridge->struct_size != sizeof(Mapping)) {
++            sceneBridge->magic = thprac_scene_bridge::kMagic;
++            sceneBridge->version = thprac_scene_bridge::kVersion;
++            sceneBridge->struct_size = sizeof(Mapping);
++            ScenePublish(Status::Idle);
++        }
++        return true;
++    }
++
++    static bool SceneTakeRequest()
++    {
++        if (!sceneBridge) return false;
++        LONG seq0 = InterlockedCompareExchange(&sceneBridge->request_sequence, 0, 0);
++        if (seq0 <= 0 || seq0 == sceneRequestSequence) return false;
++        Mapping copy {};
++        memcpy(&copy, sceneBridge, sizeof(copy));
++        MemoryBarrier();
++        LONG seq1 = InterlockedCompareExchange(&sceneBridge->request_sequence, 0, 0);
++        if (seq0 != seq1 || copy.request_sequence != seq0) return false;
++        sceneRequest = copy;
++        sceneRequestSequence = seq0;
++        sceneRetryPending = false;
++        sceneRetrySequence = 0;
++        memset(sceneRetryRequestId, 0, sizeof(sceneRetryRequestId));
++        sceneRetryDeadlineMs = 0;
++        sceneFrontendActive = true;
++        sceneDialogueHarness.Disable();
++        sceneDialogueAdvanceOverrides = 0;
++        sceneDialogueBranchVisits = 0;
++        if (copy.character < 0 || copy.character > 1 || copy.shot_type < 0 || copy.shot_type > 2 || copy.difficulty < 0 || copy.difficulty > 3 || copy.stage < 1 || copy.stage > 6 || copy.life < 0 || copy.life > 9 || copy.power < 0 || copy.power > 100 || copy.faith < 0 || copy.faith > 999990 || copy.faith % 10 || copy.invincible < 0 || copy.invincible > 1 || copy.infinite_lives < 0 || copy.infinite_lives > 1 || copy.infinite_power < 0 || copy.infinite_power > 1 || copy.time_lock < 0 || copy.time_lock > 1 || copy.auto_bomb < 0 || copy.auto_bomb > 1 || copy.no_faith_loss < 0 || copy.no_faith_loss > 1 || (copy.section_dialogue_policy != (int)SectionDialoguePolicy::Keep && copy.section_dialogue_policy != (int)SectionDialoguePolicy::SkipSectionDialogue) || copy.dialogue_advance_ms < 0 || copy.dialogue_advance_ms > (int)thprac_scene_bridge::DialogueHarness::kMaxDurationMs || copy.deadline_tick_ms <= GetTickCount64() || copy.deadline_tick_ms - GetTickCount64() > thprac_scene_bridge::kRequestTtlMaxMs) {
++            ScenePublish(Status::Rejected, Error::InvalidRequest);
++            sceneFrontendActive = false;
++            return false;
++        }
++        if (copy.dialogue_advance_ms > 0 && !sceneDialogueHooksReady) {
++            ScenePublish(Status::Rejected, Error::HookMismatch);
++            sceneFrontendActive = false;
++            return false;
++        }
++        bool sectionValid = false;
++        if (copy.section_kind == 0) sectionValid = copy.section_index == 0;
++        if (copy.section_kind == 1) {
++            static const int portions[6] = { 5, 5, 7, 8, 6, 4 };
++            sectionValid = copy.section_index >= 1 && copy.section_index <= portions[copy.stage - 1];
++        }
++        if (copy.section_kind >= 2 && copy.section_kind <= 5 && !(copy.section_kind == 2 && copy.stage == 6)) {
++            const int limit = copy.section_kind <= 3 ? 19 : 14;
++            if (copy.section_index >= 0 && copy.section_index < limit) {
++                const int stage = copy.stage - 1;
++                const int value = copy.section_kind <= 3
++                    ? th_sections_cba[stage][copy.section_kind - 2][copy.section_index]
++                    : th_sections_cbt[stage][copy.section_kind - 4][copy.section_index];
++                sectionValid = value != 0;
++            }
++        }
++        if (copy.section_kind == (int)thprac_scene_bridge::SectionKind::NormalGameStart)
++            sectionValid = copy.stage == 1 && copy.section_index == 0;
++        if (!sectionValid) {
++            ScenePublish(Status::Rejected, Error::InvalidRequest);
++            sceneFrontendActive = false;
++            return false;
++        }
++        sceneNormalRunActive = copy.section_kind == (int)thprac_scene_bridge::SectionKind::NormalGameStart;
++        ScenePublish(Status::AwaitingFrontend);
++        return true;
++    }
++
++    static void SceneFrontendTick(PCONTEXT ctx)
++    {
++        if (!sceneBridge) return;
++        if (!sceneFrontendActive) SceneTakeRequest();
++        auto* frontend = (uint8_t*)ctx->Ebx;
++        const int state = *(int32_t*)(frontend + 0x1c);
++        const int substate = *(int32_t*)(frontend + 0x20);
++        const std::uint32_t gameModeFlags = *(volatile std::uint32_t*)0x474ca0;
++        SceneBeginResponseWrite();
++        sceneBridge->observed_menu_state = state;
++        sceneBridge->observed_menu_substate = substate;
++        sceneBridge->observed_game_mode_flags = gameModeFlags;
++        SceneEndResponseWrite();
++        if (sceneRestartAwaitingTitle
++            && thprac_scene_bridge::Th10ReturnsToTitle(
++                (thprac_scene_bridge::RestartRoute)sceneRestartRoute)
++            && sceneBridge->restart_status == (LONG)thprac_scene_bridge::RestartStatus::ActionQueued
++            && sceneBridge->restart_request_sequence == sceneRestartSequence) {
++            if (GetTickCount64() >= sceneBridge->restart_deadline_tick_ms) {
++                sceneRestartAwaitingTitle = false;
++                sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::None;
++                SceneRestartPublish(sceneRestartSequence,
++                    thprac_scene_bridge::RestartStatus::Failed,
++                    thprac_scene_bridge::RestartPhase::None, 7);
++            } else if (state == 2 && substate == 2) {
++                sceneRestartAwaitingTitle = false;
++                sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::TitleReady;
++                SceneRestartPublish(sceneRestartSequence,
++                    thprac_scene_bridge::RestartStatus::TitleReady,
++                    thprac_scene_bridge::RestartPhase::TitleReady);
++            }
++        }
++        if (!sceneFrontendActive) return;
++        if (GetTickCount64() >= sceneRequest.deadline_tick_ms) {
++            ScenePublish(Status::Expired, Error::DeadlineExpired);
++            sceneFrontendActive = false;
++            return;
++        }
++        if (state == 2 && substate == 2)
++            SceneStartFromTitle(frontend);
++    }
++
+     constexpr const char* chars_supported = "!\"#$%&' ()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_abcdefghijklmnopqrstuvwxyz{|}~";
+     int g_rep_page = 0;
+ 
+@@ -122,6 +673,23 @@ namespace TH10 {
+     };
+     THPracParam thPracParam {};
+ 
++    static bool SectionHasDlg(int32_t section)
++    {
++        switch (section) {
++        case TH10_ST1_BOSS1:
++        case TH10_ST2_BOSS1:
++        case TH10_ST3_BOSS1:
++        case TH10_ST4_BOSS1:
++        case TH10_ST5_BOSS1:
++        case TH10_ST6_BOSS1:
++        case TH10_ST7_END_NS1:
++        case TH10_ST7_MID1:
++            return true;
++        default:
++            return false;
++        }
++    }
++
+     class THGuiPrac : public Gui::GameGuiWnd {
+         THGuiPrac() noexcept
+         {
+@@ -146,6 +714,8 @@ namespace TH10 {
+             case 0:
+                 break;
+             case 1:
++                if (!sceneFrontendActive)
++                    sceneNormalRunActive = false;
+                 mDiffculty = *((int32_t*)0x474c74);
+                 SetFade(0.8f, 0.1f);
+                 Open();
+@@ -173,6 +743,7 @@ namespace TH10 {
+                     break;
+                 }
+                 diff_prev = mDiffculty;
++                break;
+             case 2:
+                 break;
+             case 3:
+@@ -299,22 +870,6 @@ namespace TH10 {
+                 break;
+             }
+         }
+-        bool SectionHasDlg(int32_t section)
+-        {
+-            switch (section) {
+-            case TH10_ST1_BOSS1:
+-            case TH10_ST2_BOSS1:
+-            case TH10_ST3_BOSS1:
+-            case TH10_ST4_BOSS1:
+-            case TH10_ST5_BOSS1:
+-            case TH10_ST6_BOSS1:
+-            case TH10_ST7_END_NS1:
+-            case TH10_ST7_MID1:
+-                return true;
+-            default:
+-                return false;
+-            }
+-        }
+         void SectionWidget()
+         {
+             static char chapterStr[256] {};
+@@ -450,6 +1005,58 @@ namespace TH10 {
+         }
+         SINGLETON(THOverlay);
+     public:
++        bool ApplyBridgeSafety()
++        {
++            if (!sceneFrontendActive) return false;
++            mMuteki.Toggle(sceneRequest.invincible != 0);
++            mInfLives.Toggle(sceneRequest.infinite_lives != 0);
++            mInfPower.Toggle(sceneRequest.infinite_power != 0);
++            mTimeLock.Toggle(sceneRequest.time_lock != 0);
++            mAutoBomb.Toggle(sceneRequest.auto_bomb != 0);
++            mNoFaithLoss.Toggle(sceneRequest.no_faith_loss != 0);
++            const bool hooksMatch = mMuteki.HooksMatch(sceneRequest.invincible != 0)
++                && mInfLives.HooksMatch(sceneRequest.infinite_lives != 0)
++                && mInfPower.HooksMatch(sceneRequest.infinite_power != 0)
++                && mTimeLock.HooksMatch(sceneRequest.time_lock != 0)
++                && mAutoBomb.HooksMatch(sceneRequest.auto_bomb != 0)
++                && mNoFaithLoss.HooksMatch(sceneRequest.no_faith_loss != 0);
++            if (!hooksMatch) return false;
++            SceneBeginResponseWrite();
++            sceneBridge->applied_invincible = sceneRequest.invincible != 0;
++            sceneBridge->applied_infinite_lives = sceneRequest.infinite_lives != 0;
++            sceneBridge->applied_infinite_power = sceneRequest.infinite_power != 0;
++            sceneBridge->applied_time_lock = sceneRequest.time_lock != 0;
++            sceneBridge->applied_auto_bomb = sceneRequest.auto_bomb != 0;
++            sceneBridge->applied_no_faith_loss = sceneRequest.no_faith_loss != 0;
++            SceneEndResponseWrite();
++            return true;
++        }
++        bool BridgeSafetyMatches() const
++        {
++            static const uint8_t muteki0[] = { 0x01 };
++            static const uint8_t muteki1[] = { 0xeb };
++            static const uint8_t muteki2[] = { 0x83, 0xc4, 0x08, 0x90, 0x90 };
++            static const uint8_t infLives[] = { 0x90 };
++            static const uint8_t zero[] = { 0x00 };
++            static const uint8_t jump[] = { 0xeb };
++            static const uint8_t nop[] = { 0x90 };
++            static const uint8_t nop3[] = { 0x90, 0x90, 0x90 };
++            static const uint8_t nop6[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
++            static const uint8_t autoBomb[] = { 0xc6 };
++            const bool enabledBytesMatch = (!sceneRequest.invincible || (SceneBytesMatch(0x426d05, muteki0, sizeof(muteki0)) && SceneBytesMatch(0x425a2b, muteki1, sizeof(muteki1)) && SceneBytesMatch(0x426d69, muteki2, sizeof(muteki2))))
++                && (!sceneRequest.infinite_lives || SceneBytesMatch(0x426a15, infLives, sizeof(infLives)))
++                && (!sceneRequest.infinite_power || (SceneBytesMatch(0x4259db, zero, sizeof(zero)) && SceneBytesMatch(0x425c4a, zero, sizeof(zero)) && SceneBytesMatch(0x425abd, zero, sizeof(zero))))
++                && (!sceneRequest.time_lock || (SceneBytesMatch(0x408d93, jump, sizeof(jump)) && SceneBytesMatch(0x40e5b0, nop, sizeof(nop)) && *(uint8_t*)0x44fb9f == 0xcc))
++                && (!sceneRequest.auto_bomb || SceneBytesMatch(0x425c13, autoBomb, sizeof(autoBomb)))
++                && (!sceneRequest.no_faith_loss || (SceneBytesMatch(0x418a2b, nop3, sizeof(nop3)) && SceneBytesMatch(0x426a22, nop6, sizeof(nop6)) && SceneBytesMatch(0x412e8f, nop3, sizeof(nop3))));
++            return enabledBytesMatch
++                && mMuteki.HooksMatch(sceneRequest.invincible != 0)
++                && mInfLives.HooksMatch(sceneRequest.infinite_lives != 0)
++                && mInfPower.HooksMatch(sceneRequest.infinite_power != 0)
++                && mTimeLock.HooksMatch(sceneRequest.time_lock != 0)
++                && mAutoBomb.HooksMatch(sceneRequest.auto_bomb != 0)
++                && mNoFaithLoss.HooksMatch(sceneRequest.no_faith_loss != 0);
++        }
+ 
+     protected:
+         virtual void OnLocaleChange() override
+@@ -561,6 +1168,203 @@ namespace TH10 {
+         GuiHotKey mElBgm { TH_EL_BGM, "F7", VK_F7 };
+     };
+ 
++    static int CalcSceneSection(const Mapping& req)
++    {
++        const int stage = req.stage - 1;
++        switch ((thprac_scene_bridge::SectionKind)req.section_kind) {
++        case thprac_scene_bridge::SectionKind::StageStart: return 0;
++        case thprac_scene_bridge::SectionKind::StagePortion:
++            return 10000 + req.stage * 100 + req.section_index;
++        case thprac_scene_bridge::SectionKind::Midboss: return th_sections_cba[stage][0][req.section_index];
++        case thprac_scene_bridge::SectionKind::Boss: return th_sections_cba[stage][1][req.section_index];
++        case thprac_scene_bridge::SectionKind::Nonspell: return th_sections_cbt[stage][0][req.section_index];
++        case thprac_scene_bridge::SectionKind::Spell: return th_sections_cbt[stage][1][req.section_index];
++        default: return -1;
++        }
++    }
++
++    static void SceneStartFromTitle(uint8_t* frontend)
++    {
++        if (sceneBridge->status != (LONG)Status::AwaitingFrontend) return;
++        if ((uintptr_t)frontend != GetMemContent(0x47784c)
++            || GetMemContent(0x491fb4) != 4 || GetMemContent(0x491fb8) != 4
++            || GetMemContent(0x477810) != 0 || GetMemContent(0x474ca0) != 0) {
++            ScenePublish(Status::Failed, Error::FrontendMismatch);
++            sceneFrontendActive = false;
++            return;
++        }
++        if (!THOverlay::singleton().ApplyBridgeSafety()) {
++            ScenePublish(Status::Failed, Error::SafetyReadbackMismatch);
++            sceneFrontendActive = false;
++            return;
++        }
++
++        thPracParam.Reset();
++        if (!sceneNormalRunActive) {
++            constexpr int stageSixSpeeds[] = { 140, 120, 100, 50 };
++            thPracParam.mode = 1;
++            thPracParam.stage = sceneRequest.stage - 1;
++            thPracParam.section = CalcSceneSection(sceneRequest);
++            thPracParam.dlg = SectionHasDlg(thPracParam.section)
++                && sceneRequest.section_dialogue_policy == (int)SectionDialoguePolicy::Keep;
++            thPracParam.life = sceneRequest.life;
++            thPracParam.power = sceneRequest.power;
++            thPracParam.faith = sceneRequest.faith;
++            thPracParam.faith_bar = 130;
++            thPracParam.st6_boss9_spd = stageSixSpeeds[sceneRequest.difficulty];
++        }
++
++        // Commit the retail shot/stage confirmation fields on the game thread.
++        // The supervisor consumes command 7 and owns frontend teardown.
++        *(int32_t*)0x474c68 = sceneRequest.character;
++        *(int32_t*)0x474c6c = sceneRequest.shot_type;
++        *(int32_t*)0x474c74 = sceneRequest.difficulty;
++        *(int32_t*)0x474c7c = sceneRequest.stage;
++        *(int32_t*)0x474c80 = sceneRequest.stage;
++        *(uint32_t*)0x477848 = 0x474788u + 0x30u * sceneRequest.stage;
++        *(uint32_t*)0x474ca0 = sceneNormalRunActive ? 0u : thprac_scene_bridge::kTh10PracticeModeFlag;
++
++        // SetScreen uses the retail private ABI (EAX=frontend, ECX=screen).
++        __asm {
++            mov eax, frontend
++            mov ecx, 3
++            mov edx, 0x42c5c0
++            call edx
++        }
++        ((void (__stdcall*)(float))0x420c30)(6.0f); // Retail title BGM fade.
++        ScenePublish(Status::StartPending);
++        *(int32_t*)0x491fb8 = 7;
++    }
++
++    static bool SceneRestartStartupShouldVerify()
++    {
++        if (!sceneRetryPending) return false;
++        const uint64_t now = GetTickCount64();
++        if (now >= sceneRetryDeadlineMs) {
++            sceneRetryPending = false;
++            return false;
++        }
++        if (!sceneBridge || sceneRequestSequence <= 0 || sceneRetrySequence <= 0)
++            return false;
++        const LONG requestSequence = InterlockedCompareExchange(
++            &sceneBridge->restart_request_sequence, 0, 0);
++        const LONG responseLockBefore = InterlockedCompareExchange(
++            &sceneBridge->response_lock, 0, 0);
++        const LONG restartStatus = InterlockedCompareExchange(
++            &sceneBridge->restart_status, 0, 0);
++        const LONG restartPhase = InterlockedCompareExchange(
++            &sceneBridge->restart_phase, 0, 0);
++        uint8_t restartRequestId[16] = {};
++        uint8_t restartSceneRequestId[16] = {};
++        memcpy(restartRequestId, sceneBridge->restart_scene_request_id, sizeof(restartRequestId));
++        memcpy(restartSceneRequestId, sceneRequest.request_id, sizeof(restartSceneRequestId));
++        MemoryBarrier();
++        const LONG responseLockAfter = InterlockedCompareExchange(
++            &sceneBridge->response_lock, 0, 0);
++        const LONG requestSequenceAfter = InterlockedCompareExchange(
++            &sceneBridge->restart_request_sequence, 0, 0);
++        const bool sameRequest = responseLockBefore == responseLockAfter
++            && !(responseLockAfter & 1)
++            && requestSequence == requestSequenceAfter
++            && requestSequence == sceneRetrySequence
++            && sceneBridge->restart_response_sequence == sceneRetrySequence
++            && sceneRetrySequence == sceneRestartSequence
++            && memcmp(restartRequestId, sceneRetryRequestId, sizeof(restartRequestId)) == 0
++            && memcmp(restartSceneRequestId, sceneRetryRequestId, sizeof(restartSceneRequestId)) == 0;
++        const bool practiceMode = (GetMemContent(0x474ca0)
++            & thprac_scene_bridge::kTh10PracticeModeFlag) != 0
++            && thPracParam.mode == 1;
++        const bool beforeDeadline = now < sceneBridge->restart_deadline_tick_ms
++            && now < sceneRetryDeadlineMs;
++        return sameRequest && beforeDeadline
++            && (sceneNormalRunActive ? thPracParam.mode == 0 : practiceMode)
++            && restartStatus == (LONG)thprac_scene_bridge::RestartStatus::ActionQueued
++            && restartPhase == (LONG)thprac_scene_bridge::RestartPhase::AwaitStartup;
++    }
++
++    static void SceneVerifyStarted()
++    {
++        if (!sceneFrontendActive || !sceneBridge || sceneBridge->status != (LONG)Status::StartPending) return;
++        const int rawFaith = *(int32_t*)0x474c4c;
++        const std::uint32_t gameModeFlags = *(volatile std::uint32_t*)0x474ca0;
++        SceneBeginResponseWrite();
++        sceneBridge->observed_character = *(int32_t*)0x474c68;
++        sceneBridge->observed_shot_type = *(int32_t*)0x474c6c;
++        sceneBridge->observed_difficulty = *(int32_t*)0x474c74;
++        sceneBridge->observed_game_mode_flags = gameModeFlags;
++        SceneEndResponseWrite();
++        const bool normalGame = sceneRequest.section_kind == (int)thprac_scene_bridge::SectionKind::NormalGameStart;
++        const auto patchVerification = SceneVerifyKnownSectionPatch();
++        const bool okay = *(int32_t*)0x474c68 == sceneRequest.character
++            && *(int32_t*)0x474c6c == sceneRequest.shot_type
++            && *(int32_t*)0x474c74 == sceneRequest.difficulty
++            && *(int32_t*)0x474c7c == sceneRequest.stage
++            && *(int32_t*)0x474c80 == sceneRequest.stage
++            && (normalGame
++                ? (sceneRequest.stage == 1
++                    && thPracParam.mode == 0
++                    && (gameModeFlags & thprac_scene_bridge::kTh10PracticeModeFlag) == 0)
++                : (*(int32_t*)0x474c70 == sceneRequest.life
++                    && *(int32_t*)0x474c48 == sceneRequest.power
++                    && *(int32_t*)0x474c4c == sceneRequest.faith / 10
++                    && thPracParam.stage + 1 == sceneRequest.stage
++                    && thPracParam.section == CalcSceneSection(sceneRequest)
++                    && (gameModeFlags & thprac_scene_bridge::kTh10PracticeModeFlag) != 0))
++            && THOverlay::singleton().BridgeSafetyMatches();
++        if (okay && sceneRequest.dialogue_advance_ms > 0
++            && !sceneDialogueHarness.Arm(GetTickCount64(), (uint32_t)sceneRequest.dialogue_advance_ms)) {
++            sceneDialogueHarness.Disable();
++            ScenePublish(Status::Failed, Error::HookMismatch);
++        } else if (okay && patchVerification == SectionPatchVerification::Mismatch) {
++            sceneDialogueHarness.Disable();
++            SceneBeginResponseWrite();
++            sceneBridge->section_dialogue_policy = sceneRequest.section_dialogue_policy;
++            sceneBridge->section_patch_verification = (int)SectionPatchVerification::Mismatch;
++            SceneEndResponseWrite();
++            ScenePublish(Status::Failed, Error::SectionPatchMismatch);
++        } else if (okay) {
++            sceneDialogueLeaseDurationMs = sceneRequest.dialogue_advance_ms;
++            sceneDialogueLeaseDeadlineMs = sceneRequest.dialogue_advance_ms > 0
++                ? sceneDialogueHarness.deadline_ms() : 0;
++            sceneDialogueLeaseRequestSequence = sceneRequestSequence;
++            memcpy(sceneDialogueLeaseRequestId, sceneRequest.request_id, sizeof(sceneDialogueLeaseRequestId));
++            SceneBeginResponseWrite();
++            sceneBridge->applied_stage = *(int32_t*)0x474c7c;
++            sceneBridge->applied_section_kind = sceneRequest.section_kind;
++            sceneBridge->applied_section_index = sceneRequest.section_index;
++            sceneBridge->applied_section_id = normalGame ? 0 : thPracParam.section;
++            sceneBridge->applied_life = *(int32_t*)0x474c70;
++            sceneBridge->applied_power = *(int32_t*)0x474c48;
++            sceneBridge->applied_faith = rawFaith;
++            sceneBridge->applied_invincible = sceneRequest.invincible;
++            sceneBridge->applied_infinite_lives = sceneRequest.infinite_lives;
++            sceneBridge->applied_infinite_power = sceneRequest.infinite_power;
++            sceneBridge->applied_time_lock = sceneRequest.time_lock;
++            sceneBridge->applied_auto_bomb = sceneRequest.auto_bomb;
++            sceneBridge->applied_no_faith_loss = sceneRequest.no_faith_loss;
++            sceneBridge->applied_game_mode_flags = gameModeFlags;
++            sceneBridge->section_dialogue_policy = sceneRequest.section_dialogue_policy;
++            sceneBridge->section_patch_verification = (int)patchVerification;
++            sceneBridge->dialogue_advance_ms = sceneRequest.dialogue_advance_ms;
++            sceneBridge->dialogue_advance_forced = sceneDialogueAdvanceOverrides;
++            sceneBridge->dialogue_branch_visits = sceneDialogueBranchVisits;
++            sceneBridge->dialogue_advance_deadline_tick_ms = sceneDialogueLeaseDeadlineMs;
++            SceneEndResponseWrite();
++            ScenePublish(Status::StartedConfigured);
++        } else {
++            sceneDialogueHarness.Disable();
++            const bool safetyOkay = THOverlay::singleton().BridgeSafetyMatches();
++            const bool modeOkay = normalGame
++                ? (gameModeFlags & thprac_scene_bridge::kTh10PracticeModeFlag) == 0
++                : (gameModeFlags & thprac_scene_bridge::kTh10PracticeModeFlag) != 0;
++            const auto error = !safetyOkay ? Error::SafetyReadbackMismatch
++                : !modeOkay ? Error::PracticeModeNotConfirmed
++                : Error::StartupReadbackMismatch;
++            ScenePublish(Status::Failed, error);
++        }
++        sceneFrontendActive = false;
++    }
++
+     EHOOK_ST(th10_all_clear_bonus_1, 0x416c3d, 7, {
+         pCtx->Eip = 0x416c56;
+     });
+@@ -2328,7 +3132,7 @@ namespace TH10 {
+         THGuiRep::singleton().State(3);
+     })
+     EHOOK_DY(th10_patch_main, 0x417c5e, 3, {
+-        if (thPracParam.mode == 1) {
++        if (thPracParam.mode == 1 && !sceneNormalRunActive) {
+             *(int32_t*)(0x474c70) = thPracParam.life;
+             *(int32_t*)(0x474c48) = thPracParam.power;
+             *(int32_t*)(0x474c4c) = thPracParam.faith / 10;
+@@ -2358,6 +3162,23 @@ namespace TH10 {
+             }
+ 
+             THSectionPatch();
++            SceneDialogueLeaseTick();
++        }
++        if (SceneRestartStartupShouldVerify()) {
++            sceneFrontendActive = true;
++            ScenePublish(Status::StartPending);
++            SceneVerifyStarted();
++            sceneRetryPending = false;
++            const bool verified = sceneBridge->status == (LONG)Status::StartedConfigured;
++            sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::Complete;
++            SceneRestartPublish(sceneRestartSequence,
++                verified ? thprac_scene_bridge::RestartStatus::RetryStarted
++                         : thprac_scene_bridge::RestartStatus::Failed,
++                thprac_scene_bridge::RestartPhase::Complete, verified ? 0 : 8);
++        } else if (sceneFrontendActive && sceneBridge
++            && sceneBridge->status == (LONG)Status::StartPending) {
++            SceneDialogueLeaseTick();
++            SceneVerifyStarted();
+         }
+         thPracParam._playLock = true;
+     })
+@@ -2516,6 +3337,37 @@ namespace TH10 {
+     })
+     HOOKSET_ENDDEF()
+ 
++    HOOKSET_DEFINE(SceneBridgeHook)
++    // Commit after the title handler runs so it cannot replace the queued command.
++    EHOOK_DY(th10_scene_frontend, 0x42d19f, 6, {
++        SceneFrontendTick(pCtx);
++    })
++    EHOOK_DY(th10_scene_restart_input, 0x44a8bd, 8, {
++        if (thprac_scene_bridge::Th10RestartInputTargetMatches(
++                (LONG)pCtx->Ebx, (uint32_t)pCtx->Esi)) {
++            __try {
++                const bool inputActive = *(volatile LONG*)0x4924fc != 0;
++                ScenePollRestart(inputActive);
++            } __except (EXCEPTION_EXECUTE_HANDLER) {
++                if (sceneBridge) {
++                    const LONG sequence = InterlockedCompareExchange(
++                        &sceneBridge->restart_request_sequence, 0, 0);
++                    if (sequence > 0 && sequence == sceneRestartSequence) {
++                        sceneRestartPhase = (LONG)thprac_scene_bridge::RestartPhase::None;
++                        SceneRestartPublish(sequence,
++                            thprac_scene_bridge::RestartStatus::Failed,
++                            thprac_scene_bridge::RestartPhase::None, 4);
++                    }
++                }
++            }
++        }
++    })
++    HOOKSET_ENDDEF()
++
++    EHOOK_ST(th10_scene_dialogue_wait, 0x416a4c, 6, {
++        SceneDialogueBranch(pCtx, 10);
++    });
++
+     static __declspec(noinline) void THGuiCreate() {
+         if (ImGui::GetCurrentContext()) {
+             return;
+@@ -2562,4 +3414,29 @@ namespace TH10 {
+ void TH10InitReal()
+ {
+     EnableAllHooks(TH10::THInitHook);
++    TH10::SceneOpenMapping();
++    static const uint8_t frontendTailExpected[] = { 0x8b, 0x93, 0xb4, 0x02, 0x00, 0x00 };
++    static const uint8_t restartInputExpected[] = {
++        0x66, 0x8b, 0x0e, 0xbb, 0x01, 0x00, 0x00, 0x00 };
++    static const uint8_t setScreenExpected[] = { 0x33, 0xd2, 0x89, 0x48, 0x1c, 0x89, 0x50, 0x20 };
++    static const uint8_t titleFadeExpected[] = { 0xd9, 0x05, 0x04, 0x0b, 0x47, 0x00 };
++    static const uint8_t startDispatchExpected[] = { 0xf8, 0x19, 0x42, 0x00 };
++    if (TH10::SceneBytesMatch(0x42d19f, frontendTailExpected, sizeof(frontendTailExpected))
++        && TH10::SceneBytesMatch(0x42c5c0, setScreenExpected, sizeof(setScreenExpected))
++        && TH10::SceneBytesMatch(0x420c30, titleFadeExpected, sizeof(titleFadeExpected))
++        && TH10::SceneBytesMatch(0x421b28, startDispatchExpected, sizeof(startDispatchExpected))
++        && thprac_scene_bridge::Th10RestartInputHookSiteMatches(
++            (const uint8_t*)0x44a8bd, sizeof(restartInputExpected))) {
++        EnableAllHooks(TH10::SceneBridgeHook);
++        const bool dialogueWaitValid = TH10::sceneDialogueHarness.ValidateSite(
++            thprac_scene_bridge::DialogueHarness::kBranch, (const uint8_t*)0x416a4c, 6);
++        TH10::sceneDialogueHooksReady = dialogueWaitValid;
++        if (TH10::sceneDialogueHooksReady) {
++            TH10::th10_scene_dialogue_wait.Setup();
++            TH10::th10_scene_dialogue_wait.Enable();
++        }
++        if (TH10::sceneBridge) TH10::ScenePublish(TH10::Status::Idle);
++    } else if (TH10::sceneBridge) {
++        TH10::ScenePublish(TH10::Status::Failed, TH10::Error::HookMismatch);
++    }
+ }

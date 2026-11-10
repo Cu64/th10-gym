@@ -1,0 +1,7 @@
+LIBRARY th10_hook
+EXPORTS
+    Th10InitializeHook=_Th10InitializeHook@4
+    Th10CalcChainHookWrapper=_Th10CalcChainHookWrapper@4
+    Th10ReplayAdapterHookWrapper=_Th10ReplayAdapterHookWrapper@0
+    Th10PlayerAdapterHookWrapper=_Th10PlayerAdapterHookWrapper@0
+    Th10WholeTickStepWrapper=_Th10WholeTickStepWrapper@4

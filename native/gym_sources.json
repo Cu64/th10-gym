@@ -1,0 +1,48 @@
+{
+  "hook": [
+    "src/hook/hook.cpp",
+    "src/hook/tick_hooks.cpp",
+    "src/hook/game_memory.cpp",
+    "src/hook/image_check.cpp",
+    "src/hook/snapshot_capture.cpp",
+    "src/hook/input_controller.cpp",
+    "src/hook/tick_gate.cpp",
+    "src/hook/snapshot_writer.cpp",
+    "src/hook/entity_tables.cpp",
+    "src/common/file_sha256.cpp"
+  ],
+  "definition": "src/hook/th10_hook.def",
+  "installer": [
+    "src/installer/installer.cpp",
+    "src/installer/report.cpp",
+    "src/installer/remote_process.cpp",
+    "src/installer/pe_file.cpp",
+    "src/installer/hook_loader.cpp",
+    "src/installer/call_patcher.cpp",
+    "src/common/file_sha256.cpp"
+  ],
+  "atomic": "src/atomic/atomic_helper.cpp",
+  "headers": [
+    "include/th10/file_sha256.h",
+    "include/th10/game_hooks.h",
+    "include/th10/hook_internal.h",
+    "include/th10/hook_status.h",
+    "include/th10/input_bits.h",
+    "include/th10/input_channel.h",
+    "include/th10/input_controller.h",
+    "include/th10/snapshot_format.h",
+    "include/th10/snapshot_layout_checks.h",
+    "include/th10/tick_gate.h",
+    "include/th10/tick_input_control.h",
+    "include/th10/tick_verifier.h"
+  ],
+  "scene_bridge": [
+    "scripts/build_scene_bridge.ps1",
+    "scripts/build_support.ps1",
+    "thprac_scene_bridge/thprac_scene_bridge.patch",
+    "thprac_scene_bridge/protocol.h",
+    "thprac_scene_bridge/protocol_fixture.cpp",
+    "thprac_scene_bridge/dialogue_harness.h",
+    "thprac_scene_bridge/dialogue_harness_fixture.cpp"
+  ]
+}
